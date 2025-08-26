@@ -1,0 +1,20 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data directories
+data/
+
+# Jupyter notebooks (if you want to ignore them)
+rope.ipynb
+test.ipynb
+
+# VS Code settings (optional)
+.vscode/
+
+# Virtual environment
+.venv/
+venv/
+
