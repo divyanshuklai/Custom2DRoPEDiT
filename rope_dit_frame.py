@@ -27,7 +27,7 @@ class TimestepEmbedder(nn.Module):
         """
         :param t: timesteps (bs,)
         :param dim: frequency embedding dim
-        :return: timesteps_embedded (bs, model_dim)
+        :return: timesteps_embedded (bs, dim)
         """
         half = dim // 2
         freqs = torch.exp(
@@ -47,49 +47,33 @@ class TimestepEmbedder(nn.Module):
 
 
 class LabelEmbedder(nn.Module):
-    def __init__(self, num_classes : int, model_dim : int, drop_prob : float):
+    def __init__(self, num_classes : int, model_dim : int, use_cfg : bool):
         super().__init__()
-        enable_CFG = drop_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + enable_CFG, model_dim)
+        self.embedding_table = nn.Embedding(num_classes + use_cfg, model_dim)
         self.num_classes = num_classes
         self.model_dim = model_dim
-        self.drop_prob = drop_prob
+        self.use_cfg = use_cfg
 
-    def token_drop(self, labels : torch.Tensor, force_drop_ids : torch.Tensor | None =None):
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.drop_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels) #self.num_classes = last index in embedding table (no class phi)
-
-        return labels
-    
-    def forward(self, labels : torch.Tensor, train : bool, force_drop_ids=None):
+    def forward(self, labels : torch.LongTensor, train : bool):
         """
         :param labels: (bs, )
         """
-
-        labels = labels.long()
-
-        use_CFG = self.drop_prob > 0
-        if (train and use_CFG) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
         label_embeddings = self.embedding_table(labels)
         return label_embeddings    
 
 class Patchifier(nn.Module):
-    def __init__(self, model_dim : int, patch_size : tuple[int, int] | int, in_channles : int):
+    def __init__(self, model_dim : int, patch_size : int, in_channels : int):
         super().__init__()
         # (bs, C, H, W)
         # (bs, tok, C*ps*ps)
         # (bs, tok, model_dim)
 
         self.patch_size = patch_size
-        self.in_channels = in_channles
+        self.in_channels = in_channels
         self.model_dim = model_dim
 
         self.encoder = nn.Sequential(
-            nn.Linear(in_channles * patch_size * patch_size, model_dim),
+            nn.Linear(in_channels * patch_size * patch_size, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
@@ -97,7 +81,7 @@ class Patchifier(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(model_dim, model_dim),
             nn.SiLU(),
-            nn.Linear(model_dim, in_channles * patch_size * patch_size)
+            nn.Linear(model_dim, in_channels * patch_size * patch_size)
         )
 
     def forward(self, x : torch.Tensor):
@@ -113,7 +97,7 @@ class Patchifier(nn.Module):
 
 
 def scale_and_shift(x : torch.Tensor, scale : torch.Tensor, shift : torch.Tensor):
-    return x * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(1).unsqueeze(1)
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 ############################################
 ########        Transformer     ############
@@ -121,14 +105,17 @@ def scale_and_shift(x : torch.Tensor, scale : torch.Tensor, shift : torch.Tensor
 
 class RoPE2DMHA(nn.Module):
     def __init__(self, model_dim : int, num_attn_heads : int):
+
+        assert (model_dim // num_attn_heads) % 4 == 0, "attn_dim should be multiple of 4 for 2D RoPE"
+
         super().__init__()
         self.model_dim = model_dim
         self.num_heads = num_attn_heads
         self.attn_dim = model_dim // num_attn_heads
 
-        self.Wq = nn.Linear(model_dim, model_dim, bias=False)
-        self.Wk = nn.Linear(model_dim, model_dim, bias=False)
-        self.Wv = nn.Linear(model_dim, model_dim, bias=False)
+        self.Wq = nn.Linear(model_dim, model_dim, bias=True)
+        self.Wk = nn.Linear(model_dim, model_dim, bias=True)
+        self.Wv = nn.Linear(model_dim, model_dim, bias=True)
         self.outproj = nn.Linear(model_dim, model_dim)
 
     def apply_rope(self, W : torch.Tensor, cos : torch.Tensor, sin : torch.Tensor):
@@ -192,9 +179,9 @@ class DiTBlock(nn.Module):
 
         self.attn = RoPE2DMHA(model_dim, num_attn_heads)
         self.adaLN = nn.Sequential(
-            nn.Linear(2*model_dim, model_dim),
+            nn.Linear(2 * model_dim, model_dim),
             nn.SiLU(),
-            nn.Linear(model_dim, 6)
+            nn.Linear(model_dim, 6 * model_dim)
         )
         self.pointwiseffn = nn.Sequential(
             nn.Linear(model_dim, 2*model_dim),
@@ -204,29 +191,24 @@ class DiTBlock(nn.Module):
     
     def forward(self, x : torch.Tensor, c : torch.Tensor, cos : torch.Tensor, sin : torch.Tensor):
 
-        res = x
+        res = x #(bs, tok, dim)
 
-        coefs = self.adaLN(c)
-        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = [coefs[...,i] for i in range(6)]
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaLN(c).chunk(6, dim=1) #(bs, dim)
 
         x = F.layer_norm(x, [self.model_dim])
 
         x = scale_and_shift(x, gamma1, beta1)
 
-        x = self.attn(x, cos, sin)
-
-        x = scale_and_shift(x, alpha1, torch.zeros_like(alpha1))
+        x = alpha1.unsqueeze(1) * self.attn(x, cos, sin)
 
         x = x + res
         res = x
 
         x = F.layer_norm(x, [self.model_dim])
 
-        x = scale_and_shift(x, beta2, gamma2)
+        x = scale_and_shift(x, gamma2, beta2)
 
-        x = self.pointwiseffn(x)
-
-        x = scale_and_shift(x, alpha1, torch.zeros_like(alpha2))
+        x = alpha2.unsqueeze(1) * self.pointwiseffn(x)
 
         x = x + res
 
@@ -234,7 +216,7 @@ class DiTBlock(nn.Module):
 
 class RoPEDiT(nn.Module):
     def __init__(self, model_dim : int, num_dit_blocks : int, num_attn_heads : int, 
-                 patch_size : int, num_classes : int, drop_prob : float, in_channels : int = 3):
+                 patch_size : int, num_classes : int, in_channels : int = 3, use_cfg = True):
         super().__init__()
 
         self.patch_size = patch_size
@@ -242,13 +224,13 @@ class RoPEDiT(nn.Module):
         self.num_dit_blocks = num_dit_blocks
         self.num_attn_heads = num_attn_heads
         self.num_classes = num_classes
-        self.drop_prob = drop_prob
+        self.use_cfg = use_cfg
 
         self.rope_cache = {}
 
         self.tokenizer = Patchifier(model_dim, patch_size, in_channels)
         self.time_embedder = TimestepEmbedder(model_dim)
-        self.label_embedder = LabelEmbedder(num_classes, model_dim, drop_prob)
+        self.label_embedder = LabelEmbedder(num_classes, model_dim, use_cfg)
 
         self.dit_blocks = nn.ModuleList([
             DiTBlock(model_dim, num_attn_heads) for _ in range(num_dit_blocks)
@@ -268,12 +250,15 @@ class RoPEDiT(nn.Module):
         :param image_size: (H, W)
         """
 
+        assert image_size[0]%self.patch_size == 0, "Image height must be divisible by patch_size"
+        assert image_size[1]%self.patch_size == 0, "Image width must be divisible by patch_size"
+
         num_rows, num_columns = image_size[0] // self.patch_size, image_size[1] // self.patch_size
         num_pairs = (self.model_dim // self.num_attn_heads) // 4
         attn_dim = self.model_dim // self.num_attn_heads
 
         rows, cols = torch.meshgrid(
-            torch.arange(num_rows), torch.arange(num_columns)
+            torch.arange(num_rows), torch.arange(num_columns), indexing='ij'
         )  #(rows, cols)
 
         freqs = 10_000 ** (
@@ -297,7 +282,7 @@ class RoPEDiT(nn.Module):
 
         self.rope_cache[image_size] = (cos_tensor, sin_tensor)
 
-    def forward(self, x, t, y):
+    def forward(self, x : torch.Tensor, t : torch.Tensor, y : torch.LongTensor):
         """
         forward pass in RoPEDiT
 
@@ -324,8 +309,11 @@ class RoPEDiT(nn.Module):
 
         return x
     
-    def forwardCFG(self, x, t, y, cfg_scale):
-        y_null = torch.fill(torch.zeros_like(y), self.num_classes)
+    def forwardCFG(self, x : torch.Tensor, t : torch.Tensor, y : torch.LongTensor, cfg_scale : float = 1):
+
+        assert self.use_cfg, "CFG was not enabled during init"
+
+        y_null = torch.full_like(y, self.num_classes)
 
         cond = self(x, t, y)
         uncond = self(x, t, y_null)

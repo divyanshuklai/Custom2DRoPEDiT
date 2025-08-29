@@ -4,14 +4,17 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Data directories
+#directories
 data/
+diffgen/
+models/
+wandb/
 
-# Jupyter notebooks (if you want to ignore them)
+# Jupyter notebooks
 rope.ipynb
 test.ipynb
 
-# VS Code settings (optional)
+# VS Code settings
 .vscode/
 
 # Virtual environment
