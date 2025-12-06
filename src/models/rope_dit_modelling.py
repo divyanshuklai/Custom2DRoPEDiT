@@ -35,7 +35,8 @@ class TimestepEmbedder(nn.Module):
         ).to(device=t.device)
         theta = t.unsqueeze(-1).float() * freqs.unsqueeze(0)
         embeddings = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1)
-        if dim%2:
+        if dim%2: 
+            #ensure dimensions even.
             embeddings = torch.cat([embeddings, torch.zeros_like(embeddings[:, :1])],  dim=-1)
         return embeddings
     
@@ -113,9 +114,7 @@ class RoPE2DMHA(nn.Module):
         self.num_heads = num_attn_heads
         self.attn_dim = model_dim // num_attn_heads
 
-        self.Wq = nn.Linear(model_dim, model_dim, bias=True)
-        self.Wk = nn.Linear(model_dim, model_dim, bias=True)
-        self.Wv = nn.Linear(model_dim, model_dim, bias=True)
+        self.Wqkv = nn.Linear(model_dim, 3 * model_dim, bias=True)
         self.outproj = nn.Linear(model_dim, model_dim)
 
     def apply_rope(self, W : torch.Tensor, cos : torch.Tensor, sin : torch.Tensor):
@@ -153,7 +152,10 @@ class RoPE2DMHA(nn.Module):
 
         bs, num_tokens, _ = x.shape
 
-        Q, K, V =  self.Wq(x), self.Wk(x), self.Wv(x)
+        Q, K, V =  torch.split(self.Wqkv(x), 3, dim=-1)
+        assert Q.shape[-1] == self.model_dim
+        assert K.shape[-1] == self.model_dim
+        assert V.shape[-1] == self.model_dim
 
         Q = Q.view(bs, num_tokens, self.num_heads, self.attn_dim).transpose(1, 2)
         K = K.view(bs, num_tokens, self.num_heads, self.attn_dim).transpose(1, 2)

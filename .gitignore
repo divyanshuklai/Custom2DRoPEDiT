@@ -6,13 +6,12 @@ __pycache__/
 
 #directories
 data/
-diffgen/
-models/
+trained/
 wandb/
 
 # Jupyter notebooks
 rope.ipynb
-test.ipynb
+
 
 # VS Code settings
 .vscode/

@@ -19,7 +19,7 @@ class RectifiedFlowTrainer:
 
         x = (1 - t_) * torch.randn_like(z) + t_ * z 
 
-        if drop_ids != 0:
+        if self.drop_prob != 0:
             drop_ids = torch.rand_like(y, dtype=torch.float32) < self.drop_prob
             y = torch.where(drop_ids, self.model.num_classes, y)
 
